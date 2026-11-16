@@ -9,6 +9,7 @@ export default function Servicios({ servicios, alReservar }) {
           <h2>Servicios pensados para ti</h2>
           <p>Cortes con intención, buenos productos y el tiempo que mereces.</p>
         </div>
+        {servicios.length === 0 ? <p className="catalog-state">No hay servicios activos disponibles por ahora.</p> : (
         <div className="services-grid">
           {servicios.map((servicio, indice) => (
             <article className="service-card" key={servicio.id}>
@@ -36,6 +37,7 @@ export default function Servicios({ servicios, alReservar }) {
             </article>
           ))}
         </div>
+        )}
       </div>
     </section>
   );

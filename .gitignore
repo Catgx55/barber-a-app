@@ -4,3 +4,15 @@ backend/target/
 .env
 .env.*
 !.env.example
+# Archivos de IDEs y editores
+.vscode/
+.idea/
+*.iml
+.settings/
+.project
+.classpath
+
+# Logs y archivos temporales del sistema
+*.log
+.DS_Store
+Thumbs.db

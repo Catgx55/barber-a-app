@@ -1,35 +1,20 @@
 import { useEffect, useState } from 'react';
+import { apiRequest } from '../api.js';
 import MedioPago from './MedioPago.jsx';
 import PanelBarbero from './PanelBarbero.jsx';
 import Reseña from './Resena.jsx';
 import Servicios from './Servicios.jsx';
-import { BARBEROS, CLAVE_CITAS, COP, METODOS_PAGO, SERVICIOS } from '../data.js';
+import { COP, IMAGENES_SERVICIOS, METODOS_PAGO } from '../data.js';
 
 const FORMULARIO_VACIO = {
   cliente: '',
   telefono: '',
   correo: '',
   servicioId: '',
-  barbero: '',
+  barberoId: '',
   fechaHora: '',
   metodoPago: '',
 };
-
-function leerCitas() {
-  try {
-    const guardadas = localStorage.getItem(CLAVE_CITAS);
-    if (!guardadas) return { citas: [], error: '' };
-
-    const citas = JSON.parse(guardadas);
-    if (!Array.isArray(citas)) throw new Error('El formato guardado no es válido.');
-    return { citas, error: '' };
-  } catch (error) {
-    return {
-      citas: [],
-      error: `No se pudieron leer las reservas guardadas: ${error.message}`,
-    };
-  }
-}
 
 function fechaHoraLocal(fecha) {
   const desplazamiento = fecha.getTimezoneOffset() * 60_000;
@@ -43,24 +28,50 @@ function siguienteHorarioDisponible() {
   return fechaHoraLocal(siguiente);
 }
 
+function adaptarServicio(service) {
+  return {
+    id: service.id,
+    nombre: service.name,
+    descripcion: service.description,
+    precio: Number(service.price),
+    duracion: service.durationMinutes,
+    imagen: IMAGENES_SERVICIOS[service.name] ?? IMAGENES_SERVICIOS['Fade clásico'],
+  };
+}
+
 export default function AgendarCita() {
-  const [datosGuardados] = useState(leerCitas);
-  const [citas, setCitas] = useState(datosGuardados.citas);
-  const [aviso, setAviso] = useState(datosGuardados.error);
   const [temaOscuro, setTemaOscuro] = useState(true);
   const [vistaPanel, setVistaPanel] = useState(false);
   const [servicioSeleccionado, setServicioSeleccionado] = useState('');
+  const [servicios, setServicios] = useState([]);
+  const [barberos, setBarberos] = useState([]);
+  const [cargandoCatalogo, setCargandoCatalogo] = useState(true);
+  const [errorCatalogo, setErrorCatalogo] = useState('');
   const [formulario, setFormulario] = useState(FORMULARIO_VACIO);
   const [confirmacion, setConfirmacion] = useState('');
+  const [errorReserva, setErrorReserva] = useState('');
+  const [reservando, setReservando] = useState(false);
   const [fechaMinima, setFechaMinima] = useState(siguienteHorarioDisponible);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(CLAVE_CITAS, JSON.stringify(citas));
-    } catch (error) {
-      setAviso(`No se pudo guardar la reserva en este navegador: ${error.message}`);
-    }
-  }, [citas]);
+    const controller = new AbortController();
+    Promise.all([
+      apiRequest('/services', { signal: controller.signal }),
+      apiRequest('/public/barbers', { signal: controller.signal }),
+    ])
+      .then(([serviceList, barberList]) => {
+        setServicios(serviceList.filter((service) => service.isActive).map(adaptarServicio));
+        setBarberos(barberList);
+        setErrorCatalogo('');
+      })
+      .catch((error) => {
+        if (error.name !== 'AbortError') setErrorCatalogo(error.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setCargandoCatalogo(false);
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     if (!servicioSeleccionado) return;
@@ -71,72 +82,65 @@ export default function AgendarCita() {
   function actualizar(evento) {
     setFormulario((actual) => ({ ...actual, [evento.target.name]: evento.target.value }));
     setConfirmacion('');
+    setErrorReserva('');
   }
 
-  function cambiarEstado(id, estado) {
-    setCitas((actuales) => actuales.map((cita) => (cita.id === id ? { ...cita, estado } : cita)));
-  }
-
-  function reservar(evento) {
+  async function reservar(evento) {
     evento.preventDefault();
-    const servicio = SERVICIOS.find((item) => item.id === Number(formulario.servicioId));
-    const inicio = new Date(formulario.fechaHora);
+    const service = servicios.find((item) => item.id === Number(formulario.servicioId));
+    const barber = barberos.find((item) => item.id === Number(formulario.barberoId));
+    const start = new Date(formulario.fechaHora);
 
-    if (!servicio || Number.isNaN(inicio.getTime())) {
-      setAviso('Selecciona un servicio y una fecha válidos.');
+    if (!service || !barber || Number.isNaN(start.getTime())) {
+      setErrorReserva('Selecciona un servicio, barbero y horario válidos.');
+      return;
+    }
+    if (start <= new Date()) {
+      setErrorReserva('La fecha de la cita debe ser posterior a la hora actual.');
       return;
     }
 
-    if (inicio <= new Date()) {
-      setAviso('La fecha de la cita debe ser posterior a la hora actual.');
+    const [firstName, ...lastNameParts] = formulario.cliente.trim().split(/\s+/);
+    if (lastNameParts.length === 0) {
+      setErrorReserva('Escribe tu nombre y apellido para reservar.');
       return;
     }
-
-    const hora = inicio.getHours() * 60 + inicio.getMinutes();
-    const dia = inicio.getDay();
-    const apertura = dia === 0 ? 600 : 480;
-    const cierre = dia === 0 ? 960 : dia === 6 ? 1080 : 1200;
-    const fin = hora + servicio.duracion;
-    const terminaElMismoDia = fin < 1440;
-
-    if (hora < apertura || fin > cierre || !terminaElMismoDia) {
-      setAviso('El horario es lun–vie de 8:00 a. m. a 8:00 p. m.; sábados hasta las 6:00 p. m.; domingos de 10:00 a. m. a 4:00 p. m.');
-      return;
+    const [appointmentDate, startTime] = formulario.fechaHora.split('T');
+    setReservando(true);
+    setErrorReserva('');
+    try {
+      const appointment = await apiRequest('/public/appointments', {
+        method: 'POST',
+        body: {
+          firstName,
+          lastName: lastNameParts.join(' '),
+          email: formulario.correo,
+          phone: formulario.telefono,
+          barberId: barber.id,
+          appointmentDate,
+          startTime,
+          notes: '',
+          serviceIds: [service.id],
+          paymentMethod: formulario.metodoPago,
+        },
+      });
+      setFormulario(FORMULARIO_VACIO);
+      setServicioSeleccionado('');
+      setFechaMinima(siguienteHorarioDisponible());
+      setConfirmacion(
+        `¡Listo, ${appointment.clientName}! Tu cita #${appointment.id} para ${service.nombre} quedó pendiente de confirmación.`
+      );
+    } catch (error) {
+      setErrorReserva(error.message);
+    } finally {
+      setReservando(false);
     }
-
-    const reservaSuperpuesta = citas.some((cita) => {
-      if (cita.barbero !== formulario.barbero || cita.estado === 'CANCELADA') return false;
-      const inicioExistente = new Date(cita.fechaHora).getTime();
-      const finExistente = inicioExistente + cita.duracion * 60_000;
-      return inicio.getTime() < finExistente && inicio.getTime() + servicio.duracion * 60_000 > inicioExistente;
-    });
-
-    if (reservaSuperpuesta) {
-      setAviso('Ese barbero ya tiene una cita en ese horario. Elige otra hora.');
-      return;
-    }
-
-    const cita = {
-      ...formulario,
-      id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
-      servicioId: servicio.id,
-      servicio: servicio.nombre,
-      precio: servicio.precio,
-      duracion: servicio.duracion,
-      estado: 'CONFIRMADA',
-    };
-
-    setCitas((actuales) => [cita, ...actuales]);
-    setFormulario(FORMULARIO_VACIO);
-    setServicioSeleccionado('');
-    setFechaMinima(siguienteHorarioDisponible());
-    setAviso('');
-    setConfirmacion(`¡Listo, ${cita.cliente}! Guardamos tu cita de ${cita.servicio} en este navegador.`);
   }
 
   function alternarVista() {
     setVistaPanel((actual) => !actual);
-    setAviso('');
+    setConfirmacion('');
+    setErrorReserva('');
   }
 
   return (
@@ -158,9 +162,14 @@ export default function AgendarCita() {
         </nav>
       </header>
 
-      {vistaPanel ? <PanelBarbero citas={citas} actualizarEstado={cambiarEstado} /> : (
+      {vistaPanel ? <PanelBarbero /> : (
         <>
-          {aviso && <div className="connection-notice" role="alert"><span>{aviso}</span><button type="button" aria-label="Cerrar aviso" onClick={() => setAviso('')}>×</button></div>}
+          {(errorCatalogo || errorReserva) && (
+            <div className="connection-notice" role="alert">
+              <span>{errorReserva || errorCatalogo}</span>
+              <button type="button" aria-label="Cerrar aviso" onClick={() => { setErrorReserva(''); setErrorCatalogo(''); }}>×</button>
+            </div>
+          )}
           <section className="hero" id="inicio">
             <div className="hero-image" aria-hidden="true" />
             <div className="hero-content">
@@ -174,7 +183,11 @@ export default function AgendarCita() {
             <div className="hero-caption">CLÁSICOS DE SIEMPRE. ACTITUD DE HOY.</div>
           </section>
 
-          <Servicios servicios={SERVICIOS} alReservar={setServicioSeleccionado} />
+          {cargandoCatalogo ? (
+            <p className="catalog-state" role="status">Cargando servicios y barberos…</p>
+          ) : (
+            <Servicios servicios={servicios} alReservar={setServicioSeleccionado} />
+          )}
           <Reseña />
           <MedioPago />
 
@@ -189,40 +202,43 @@ export default function AgendarCita() {
               </div>
               <form className="booking-form" onSubmit={reservar}>
                 <div className="form-heading"><span className="eyebrow">Reserva en un momento</span><h3>Agenda tu cita</h3></div>
-                <label>Tu nombre<input name="cliente" autoComplete="name" placeholder="¿Cómo te llamas?" value={formulario.cliente} onChange={actualizar} required maxLength={100} /></label>
+                <label>Tu nombre completo<input name="cliente" autoComplete="name" placeholder="Nombre y apellido" value={formulario.cliente} onChange={actualizar} required maxLength={80} /></label>
                 <div className="form-row">
-                  <label>Teléfono<input name="telefono" type="tel" autoComplete="tel" placeholder="+57 300 000 0000" value={formulario.telefono} onChange={actualizar} required maxLength={20} /></label>
-                  <label>Correo electrónico<input name="correo" type="email" autoComplete="email" placeholder="tu@correo.com" value={formulario.correo} onChange={actualizar} required maxLength={150} /></label>
+                  <label>Teléfono<input name="telefono" type="tel" autoComplete="tel" placeholder="+57 300 000 0000" value={formulario.telefono} onChange={actualizar} required maxLength={25} /></label>
+                  <label>Correo electrónico<input name="correo" type="email" autoComplete="email" placeholder="tu@correo.com" value={formulario.correo} onChange={actualizar} required maxLength={190} /></label>
                 </div>
                 <label>Elige tu servicio
-                  <select name="servicioId" value={formulario.servicioId} onChange={actualizar} required>
+                  <select name="servicioId" value={formulario.servicioId} onChange={actualizar} required disabled={cargandoCatalogo || servicios.length === 0}>
                     <option value="">Selecciona un servicio</option>
-                    {SERVICIOS.map((servicio) => <option key={servicio.id} value={servicio.id}>{servicio.nombre} · {COP.format(servicio.precio)}</option>)}
+                    {servicios.map((service) => <option key={service.id} value={service.id}>{service.nombre} · {COP.format(service.precio)}</option>)}
                   </select>
                 </label>
                 <div className="form-row">
                   <label>Tu barbero
-                    <select name="barbero" value={formulario.barbero} onChange={actualizar} required>
+                    <select name="barberoId" value={formulario.barberoId} onChange={actualizar} required disabled={cargandoCatalogo || barberos.length === 0}>
                       <option value="">Elige tu barbero</option>
-                      {BARBEROS.map((barbero) => <option key={barbero} value={barbero}>{barbero}</option>)}
+                      {barberos.map((barber) => <option key={barber.id} value={barber.id}>{barber.firstName} {barber.lastName}</option>)}
                     </select>
                   </label>
                   <label>Fecha y hora<input name="fechaHora" type="datetime-local" min={fechaMinima} step={1800} value={formulario.fechaHora} onChange={actualizar} required /></label>
                 </div>
+                {!cargandoCatalogo && barberos.length === 0 && (
+                  <p className="form-footnote">No hay barberos activos disponibles para reservar en este momento.</p>
+                )}
                 <fieldset className="payment-options">
                   <legend>¿Cómo prefieres pagar?</legend>
-                  {METODOS_PAGO.map((metodo) => (
-                    <label className={`payment-option ${formulario.metodoPago === metodo.id ? 'selected' : ''}`} key={metodo.id}>
-                      <input type="radio" name="metodoPago" value={metodo.id} checked={formulario.metodoPago === metodo.id} onChange={actualizar} required />
-                      {metodo.nombre}
+                  {METODOS_PAGO.map((method) => (
+                    <label className={`payment-option ${formulario.metodoPago === method.id ? 'selected' : ''}`} key={method.id}>
+                      <input type="radio" name="metodoPago" value={method.id} checked={formulario.metodoPago === method.id} onChange={actualizar} required />
+                      {method.nombre}
                     </label>
                   ))}
                 </fieldset>
-                <button className="button button-primary form-submit" type="submit">
-                  Confirmar mi cita <span aria-hidden="true">↗</span>
+                <button className="button button-primary form-submit" type="submit" disabled={reservando || cargandoCatalogo || servicios.length === 0 || barberos.length === 0}>
+                  {reservando ? 'Guardando…' : 'Confirmar mi cita'} <span aria-hidden="true">↗</span>
                 </button>
                 {confirmacion && <p className="form-success" role="status">{confirmacion}</p>}
-                <p className="form-footnote">Tus reservas se guardan en este navegador; no se envían a un servidor.</p>
+                <p className="form-footnote">La reserva se guarda en el servidor con estado pendiente de confirmación.</p>
               </form>
             </div>
           </section>
